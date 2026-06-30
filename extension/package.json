@@ -1,0 +1,17 @@
+{
+    "id": "eez-ui-bridge",
+    "name": "eez-ui-bridge",
+    "displayName": "EEZ UI Bridge",
+    "version": "0.1.0",
+    "author": "eez-ui-mcp",
+    "description": "Local control bridge so the eez-ui MCP can drive the running EEZ Studio editor live (vibe-coding).",
+    "license": "GPL-3.0-only",
+    "main": "index.js",
+    "scripts": {
+        "pack": "node pack.mjs",
+        "install-extension": "node install.mjs"
+    },
+    "eez-studio": {
+        "node-module": true
+    }
+}

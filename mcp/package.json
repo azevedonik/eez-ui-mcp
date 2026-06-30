@@ -1,0 +1,28 @@
+{
+  "name": "eez-ui-mcp",
+  "version": "0.3.0",
+  "private": true,
+  "description": "MCP server to author EEZ Studio Dashboard UI (pages, widgets, variables, flows) live in the running editor",
+  "license": "GPL-3.0-only",
+  "repository": "https://github.com/azevedonik/eez-ui-mcp",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "eez-studio",
+    "dashboard",
+    "ui",
+    "claude"
+  ],
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:mcp": "node test/mcp.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  }
+}

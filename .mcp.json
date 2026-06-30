@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+        "eez-ui": {
+            "command": "node",
+            "args": ["mcp/server.js"]
+        }
+    }
+}
