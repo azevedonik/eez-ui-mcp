@@ -894,6 +894,7 @@ async function dispatch(op, args) {
 module.exports = {
     dispatch,
     ops,
+    getRemote, // also used by index.js for the Studio version
     // pure helpers, exported for unit tests (mcp/test/live-ops.test.js)
     resolveRefs,
     runAtomic,

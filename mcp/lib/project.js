@@ -353,7 +353,7 @@ const ALIAS_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // Does `v` look like an alias reference ("$name")?
 function isRef(v) {
-    return typeof v === "string" && v.startsWith("$");
+    return typeof v === "string" && v.length > 1 && v.startsWith("$");
 }
 
 /**
@@ -433,6 +433,16 @@ const BATCH_TOOLS = {
 
 /** Tool names accepted by applyBatch. */
 export const BATCH_TOOL_NAMES = Object.keys(BATCH_TOOLS);
+
+/**
+ * Run one authoring tool against `project` (mutating it) and return the
+ * tool's file-mode result. Shared by the single-op file fallbacks and batch.
+ */
+export function runTool(project, tool, args) {
+    const def = BATCH_TOOLS[tool];
+    if (!def) throw new Error(`unknown tool: ${tool}`);
+    return def.run(project, args);
+}
 
 // Upfront validation; throws before anything is applied.
 function validateBatch(ops) {
@@ -517,8 +527,7 @@ export function applyBatch(project, ops) {
         const k = i + 1;
         try {
             const args = structuredClone(resolveRefs(op.args || {}, refs));
-            const def = BATCH_TOOLS[op.tool];
-            const result = def.run(work, args);
+            const result = runTool(work, op.tool, args);
             const entry = { index: k, tool: op.tool };
             if (op.as !== undefined) {
                 entry.as = op.as;

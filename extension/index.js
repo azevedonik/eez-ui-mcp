@@ -89,31 +89,13 @@ function activeProjectInfo() {
 }
 
 // EEZ Studio app version (e.g. "0.29.0"), or null if it can't be resolved.
-// Cached once found; lookups are cheap but /ping is hit often.
-let studioVersionCache = null;
+// Looked up once (success or failure); /ping is hit often.
+let studioVersionCache;
 
 function studioVersion() {
-    if (studioVersionCache) return studioVersionCache;
+    if (studioVersionCache !== undefined) return studioVersionCache;
     try {
-        let remote = null;
-        if (typeof EEZStudio !== "undefined" && EEZStudio && EEZStudio.remote) {
-            remote = EEZStudio.remote;
-        } else {
-            try {
-                remote = require("@electron/remote");
-            } catch (e) {
-                // Not on the extension's require path: resolve via the app's node_modules.
-                const p = require.resolve("home/tabs-store"); // <repo>/build/home/tabs-store.js
-                const appModules = path.join(
-                    path.dirname(path.dirname(path.dirname(p))),
-                    "node_modules"
-                );
-                remote = require(require.resolve("@electron/remote", {
-                    paths: [appModules]
-                }));
-            }
-        }
-        studioVersionCache = remote.app.getVersion() || null;
+        studioVersionCache = require("./live-ops").getRemote().app.getVersion() || null;
     } catch (e) {
         studioVersionCache = null;
     }

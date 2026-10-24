@@ -220,7 +220,12 @@ export async function op(name, args = {}, timeoutMs = 60000) {
     }
     if (!r.json) throw ambiguousError("sent an empty reply");
     if (!r.json.ok) {
-        const e = new Error(r.json.error || "bridge op failed");
+        // The bridge sends the editor's error stack; keep only the message line
+        // (minus "Error: ") so live errors read like file-mode ones.
+        const msg = String(r.json.error || "")
+            .split("\n")[0]
+            .replace(/^Error: /, "");
+        const e = new Error(msg || "bridge op failed");
         e.opError = true;
         throw e;
     }

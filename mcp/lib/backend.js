@@ -153,7 +153,7 @@ export async function createDashboard(projectPath, { displayWidth, displayHeight
     // stale tab for this path is already open).
     if (await isLive()) {
         try {
-            await bridge.op("reloadProject", { project: projectPath });
+            await bridge.op("reloadProject", { project: projectPath }, OPEN_TIMEOUT_MS);
         } catch {
             /* best effort */
         }
@@ -161,9 +161,13 @@ export async function createDashboard(projectPath, { displayWidth, displayHeight
     return { created: projectPath };
 }
 
+// Opening a project can take the bridge's resolveStore up to 3 x 20 s (tab,
+// store, project); leave headroom so a slow open isn't reported as ambiguous.
+const OPEN_TIMEOUT_MS = 90000;
+
 export async function openInEditor(projectPath) {
     try {
-        await bridge.op("reloadProject", { project: projectPath });
+        await bridge.op("reloadProject", { project: projectPath }, OPEN_TIMEOUT_MS);
         return true;
     } catch (e) {
         if (!notDelivered(e)) throw e;
@@ -183,10 +187,9 @@ export function schema() {
 // --- pages -----------------------------------------------------------------
 
 export function addPage(projectPath, a) {
-    return route(projectPath, "addPage", a, () => {
-        const pg = editLocal(projectPath, proj => P.addPage(proj, a));
-        return { added: pg.name };
-    });
+    return route(projectPath, "addPage", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "add_page", a))
+    );
 }
 
 export function listPages(projectPath) {
@@ -198,29 +201,27 @@ export function listPages(projectPath) {
 // --- widgets ---------------------------------------------------------------
 
 export function addWidget(projectPath, a) {
-    return route(projectPath, "addWidget", a, () => ({
-        objID: editLocal(projectPath, proj => P.addWidget(proj, a))
-    }));
+    return route(projectPath, "addWidget", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "add_widget", a))
+    );
 }
 
 export function addActionComponent(projectPath, a) {
-    return route(projectPath, "addActionComponent", a, () => ({
-        objID: editLocal(projectPath, proj => P.addActionComponent(proj, a))
-    }));
+    return route(projectPath, "addActionComponent", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "add_action_component", a))
+    );
 }
 
 export function updateWidget(projectPath, a) {
-    return route(projectPath, "updateWidget", a, () => {
-        editLocal(projectPath, proj => P.updateWidget(proj, a));
-        return { updated: a.objID };
-    });
+    return route(projectPath, "updateWidget", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "update_widget", a))
+    );
 }
 
 export function deleteWidget(projectPath, a) {
-    return route(projectPath, "deleteWidget", a, () => {
-        editLocal(projectPath, proj => P.deleteWidget(proj, a));
-        return { deleted: a.objID };
-    });
+    return route(projectPath, "deleteWidget", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "delete_widget", a))
+    );
 }
 
 export function listWidgets(projectPath, a) {
@@ -232,10 +233,9 @@ export function listWidgets(projectPath, a) {
 // --- variables + binding ---------------------------------------------------
 
 export function addVariable(projectPath, a) {
-    return route(projectPath, "addVariable", a, () => {
-        const v = editLocal(projectPath, proj => P.addVariable(proj, a));
-        return { added: v.name, type: v.type, defaultValue: v.defaultValue };
-    });
+    return route(projectPath, "addVariable", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "add_variable", a))
+    );
 }
 
 export function listVariables(projectPath) {
@@ -245,32 +245,29 @@ export function listVariables(projectPath) {
 }
 
 export function bindWidget(projectPath, a) {
-    return route(projectPath, "bindWidget", a, () => {
-        editLocal(projectPath, proj => P.bindWidget(proj, a));
-        return { bound: a.objID, data: a.expression };
-    });
+    return route(projectPath, "bindWidget", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "bind_widget", a))
+    );
 }
 
 // --- flow ------------------------------------------------------------------
 
 export function addEventHandler(projectPath, a) {
-    return route(projectPath, "addEventHandler", a, () => {
-        const eh = editLocal(projectPath, proj => P.addEventHandler(proj, a));
-        return { widget: a.objID, ...eh };
-    });
+    return route(projectPath, "addEventHandler", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "add_event_handler", a))
+    );
 }
 
 export function connect(projectPath, a) {
-    return route(projectPath, "connect", a, () => {
-        const line = editLocal(projectPath, proj => P.connect(proj, a));
-        return { connected: `${a.source}.${a.output} -> ${a.target}.${a.input}`, line };
-    });
+    return route(projectPath, "connect", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "connect", a))
+    );
 }
 
 export function disconnect(projectPath, a) {
-    return route(projectPath, "disconnect", a, () => ({
-        removed: editLocal(projectPath, proj => P.disconnect(proj, a))
-    }));
+    return route(projectPath, "disconnect", a, () =>
+        editLocal(projectPath, proj => P.runTool(proj, "disconnect", a))
+    );
 }
 
 export function listConnections(projectPath, a) {
@@ -299,17 +296,14 @@ const OP_TO_TOOL = Object.fromEntries(
     Object.entries(TOOL_TO_OP).map(([tool, op]) => [op, tool])
 );
 
-// A live batch failure arrives as the editor's error text, stack included, with
-// bridge op names. Keep the first line, drop a leading "Error: " and report the
-// MCP tool name so live matches file mode ("batch op #k (delete_widget) ...").
+// A live batch failure names bridge ops; report the MCP tool name so live
+// matches file mode ("batch op #k (delete_widget) ..."). bridge.op() has
+// already reduced the error to its message line.
 function cleanBatchError(e) {
-    const msg = String(e.message || "")
-        .split("\n")[0]
-        .replace(/^Error: /, "")
-        .replace(
-            /^(batch op #\d+ )\((\w+)\)/,
-            (m, pre, op) => `${pre}(${OP_TO_TOOL[op] || op})`
-        );
+    const msg = String(e.message || "").replace(
+        /^(batch op #\d+ )\((\w+)\)/,
+        (m, pre, op) => `${pre}(${OP_TO_TOOL[op] || op})`
+    );
     const out = new Error(msg);
     out.opError = true;
     return out;
