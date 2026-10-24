@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.4.0
+
+Faster authoring (`batch`), safer live routing, and EEZ Studio 0.29.0 support.
+
+### Added
+
+- **`batch` tool**: apply 1-200 authoring ops in one call (`add_page`,
+  `add_widget`, `add_action_component`, `update_widget`, `delete_widget`,
+  `add_variable`, `bind_widget`, `add_event_handler`, `connect`,
+  `disconnect`), with `as` aliases / `"$alias"` substitution so later ops can
+  reference components created earlier in the same batch. All-or-nothing: live it
+  is a single undo step (rolled back on failure), in file mode a single save.
+- **Version reporting**: the bridge reports `bridgeVersion` / `studioVersion`;
+  `open_project` and `create_dashboard_project` return them and warn when the
+  installed bridge is older than the MCP expects (`node extension/install.mjs` +
+  restart EEZ Studio).
+
+### Fixed
+
+- UTF-8 corruption in bridge request bodies and responses (multi-byte characters
+  split across chunks, e.g. long pt-BR labels).
+- No silent double-apply on timeout: a request that was delivered but got no
+  answer is reported as ambiguous ("may have applied, check with `list_*`")
+  instead of being retried against the file. A bridge that answers with an error
+  (e.g. stale token after a Studio restart) is surfaced as "not applied", also
+  without file fallback.
+- `update_widget` in live mode can no longer change `objID`/`type` (that
+  rewrote the ID and broke connections); blocked in the MCP and in the bridge.
+- New projects no longer start with `"Use style": "default" not found` check
+  errors: the shipped template now includes the `default` style.
+- Fast file fallback when the discovery file is stale (dead pid): no network call
+  is attempted.
+
+### Changed
+
+- `mcp` version 0.4.0; dependency floors `@modelcontextprotocol/sdk` ^1.29.0 and
+  `zod` ^3.25.0.
+- The bridge's discovery file is written with mode 0600 (POSIX only; an existing
+  file keeps its previous mode) and removed when EEZ Studio exits.
+- Docs: supported EEZ Studio is now 0.28.x-0.29.x (tested on 0.29.0).
+
+### EEZ Studio 0.29.0
+
+Tested live against 0.29.0. That release changed no project-editor store, widget,
+flow or extension APIs (only the lz4 dependency replaced by a vendored wasm in the
+build, `eez-gui-lite` export helpers, serial-write integer arrays and LVGL
+fixes), so no compatibility changes were needed.
+
 ## 0.3.0
 
 Standalone and **fork-free** — the MCP no longer needs a built EEZ Studio checkout.

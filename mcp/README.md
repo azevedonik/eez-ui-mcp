@@ -37,14 +37,15 @@ EEZ Studio checkout is required.
 
 | Tool | Needs app? | Purpose |
 |------|:---------:|---------|
-| `create_dashboard_project(path, [displayWidth, displayHeight])` | no | New Dashboard from the template; becomes active (opened live if the app is running) |
-| `open_project(path)` | no | Set an existing project active (opened live if running) |
+| `create_dashboard_project(path, [displayWidth, displayHeight])` | no | New Dashboard from the template; becomes active (opened live if the app is running); reports `studioVersion` / `bridgeVersion` |
+| `open_project(path)` | no | Set an existing project active (opened live if running); reports `studioVersion` / `bridgeVersion` |
 | `list_widget_types([kind])` / `get_widget_schema(type)` | no | Browse the shipped component catalog |
 | `add_page` / `list_pages` | no\* | Pages |
 | `add_widget` / `update_widget` / `delete_widget` / `list_widgets` | no\* | Widgets (returns objIDs) |
 | `add_variable` / `list_variables` | no\* | Global variables |
 | `bind_widget(page, objID, expression)` | no\* | Map a widget's `data` to a variable/expression |
 | `add_action_component` / `add_event_handler` / `connect` / `disconnect` / `list_connections` | no\* | EEZ Flow |
+| `batch(ops, [project])` | no\* | Apply **many authoring ops in one call**, all-or-nothing (see [Batching](#batching)) |
 | `save()` | no\* | Persist the running editor's project (no-op in file mode) |
 | `get_checks()` | **yes** | EEZ Studio's **Checks** diagnostics: `{errors, warnings, checks:[{type, message, location, objID}]}` |
 | `render(page, [mode=design\|run])` | **yes** | **Returns a PNG** of the page (the live window) |
@@ -65,6 +66,46 @@ tool calls are serialized so overlapping calls can't corrupt the project.
   (`@seqout` → `@seqin`), or named data pins. `connect` references components by
   `objID` (returned from `add_widget` / `add_action_component`).
 
+## Batching
+
+Building a screen one op per tool call is slow: the real latency is Claude's
+turn per call, not the bridge (a call takes a few ms). `batch` applies a whole
+sequence of authoring ops in a **single** tool call.
+
+```
+batch({ project?, ops: [{ tool, args, as? }, ...] })
+```
+
+- `ops`: 1-200 entries, run in order. `tool` is one of `add_page`,
+  `add_widget`, `add_action_component`, `update_widget`, `delete_widget`,
+  `add_variable`, `bind_widget`, `add_event_handler`, `connect`,
+  `disconnect`. `args` are that tool's normal arguments (without `project`).
+- **Aliases**: an op that creates a component (`add_widget`,
+  `add_action_component`) may set `as: "btn"`. Later ops can then pass
+  `"$btn"` as `objID`, `source` or `target`, and it is replaced with the
+  created component's objID. No other field is substituted; an undefined,
+  forward-referencing or duplicate alias is rejected before anything is applied.
+- **All-or-nothing**: every op is validated up front, then applied as one unit.
+  Live, the whole batch is **one undo step** in the editor (and is rolled back if
+  an op fails); in file mode it is one save, written only if every op succeeded.
+  A failure returns `batch op #k (tool) failed: ...; nothing applied`.
+- The result is `{ via, applied, results:[{index, tool, as?, ...}], refs:{btn:"<objID>"} }`.
+
+```
+batch(ops=[
+  { tool: "add_page", args: { name: "Main" } },
+  { tool: "add_widget", as: "label", args: { page: "Main", type: "TextDashboardWidget",
+      left: 20, top: 20, width: 220, height: 30, data: "\"Hello\"" } },
+  { tool: "add_widget", as: "btn", args: { page: "Main", type: "ButtonDashboardWidget",
+      left: 20, top: 70, width: 160, height: 44, data: "\"Go\"" } },
+  { tool: "add_event_handler", args: { page: "Main", objID: "$btn", eventName: "CLICKED" } },
+  { tool: "add_action_component", as: "act", args: { page: "Main",
+      type: "SetVariableActionComponent", left: 260, top: 70, props: { entries: [] } } },
+  { tool: "connect", args: { page: "Main", source: "$btn", output: "CLICKED",
+      target: "$act", input: "@seqin" } }
+])
+```
+
 ## Example session
 
 ```
@@ -82,6 +123,31 @@ render(page="Main", mode="design")   # the editor layout + flow graph
 render(page="Main", mode="run")      # the live board
 build()                              # verify it compiles
 ```
+
+### Errors when the live editor is involved
+
+Each call picks live or file mode (see [How it works](#how-it-works)); failures
+fall into three classes:
+
+- **Bridge not reachable** (no discovery file, EEZ Studio not running, connection
+  refused): the request was never delivered, so authoring tools fall back to the
+  `.eez-project` file (`"via":"file"`).
+- **Delivered but no answer** (timeout / connection reset after the request was
+  sent): the editor **may have applied the op**. The call fails with that
+  message and does **not** fall back to the file (that could apply it twice);
+  check the result with `list_*` before retrying.
+- **Bridge answered with an error** (e.g. HTTP 401): the op was **not
+  applied**, with no file fallback, since the project is likely open in the
+  editor. On 401 the bridge rejected the token (the MCP re-reads it from the
+  discovery file on every call): restart EEZ Studio, or fix
+  `EEZ_BRIDGE_URL`/`EEZ_BRIDGE_TOKEN` if set, then retry.
+
+### Version reporting
+
+`open_project` and `create_dashboard_project` return `studioVersion` (the
+running EEZ Studio) and `bridgeVersion` (the installed `eez-ui-bridge`). If the
+installed bridge is older than this MCP expects, the result carries a
+`warning`; fix it with `node extension/install.mjs` and restart EEZ Studio.
 
 ## Registration
 
@@ -113,11 +179,11 @@ Environment variables (optional):
 ## Tests
 
 - `npm test` — fast **unit** suite (`node:test`) for `lib/project.js`,
-  `lib/bridge-client.js`, and `lib/backend.js` (file-mode routing). No app, no
-  Electron; this is the CI gate.
-- `npm run test:mcp` — drives the server over stdio like a real client (needs EEZ
-  Studio open with the plugin for the live `render`/`build`/`validate`/`get_checks`
-  steps).
+  `lib/bridge-client.js`, `lib/backend.js` (routing) and the bridge's live ops.
+  No app, no Electron.
+- `npm run test:mcp` — **live smoke test**: drives the server over stdio like a
+  real client (needs EEZ Studio open with the plugin for the live
+  `render`/`build`/`validate`/`get_checks`/`batch` steps).
 
 ## License
 

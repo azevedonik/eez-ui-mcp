@@ -186,7 +186,43 @@ function reveal(store, obj) {
     }
 }
 
-// Run a compound edit as a single undo entry.
+// Per-call context. A single op gets none; `batch` passes
+// `{ store, noReveal: true }` so every op reuses the store it resolved once
+// (no per-op tab lookup / makeActive) and nothing is revealed mid-batch —
+// `show()` just remembers the object, and batch reveals it once at the end.
+async function storeFor(project, ctx) {
+    return ctx && ctx.store ? ctx.store : resolveStore(project);
+}
+
+function show(ctx, store, obj) {
+    if (ctx && ctx.noReveal) {
+        ctx.lastShown = obj;
+        return;
+    }
+    reveal(store, obj);
+}
+
+// Props that must never go through updateObject: rewriting objID would orphan
+// every connection line / reference to the component, and `type` selects the
+// class. updateObject splits keys on "." and uses the first part, so check that.
+const RESERVED_PROPS = ["objID", "type"];
+
+function assertNoReservedProps(props) {
+    if (!props || typeof props !== "object") return;
+    const bad = RESERVED_PROPS.filter(r =>
+        Object.keys(props).some(k => k.split(".")[0] === r)
+    );
+    if (bad.length) {
+        throw new Error(
+            `props may not set ${bad.join("/")}: objID is the component's identity ` +
+                "(connections reference it) and type is fixed; delete and re-add " +
+                "the component to change its type"
+        );
+    }
+}
+
+// Run a compound edit as a single undo entry. Nests: inside an already-open
+// group (e.g. runAtomic) it neither opens nor closes anything.
 function combined(store, fn) {
     const um = store.undoManager;
     let close = false;
@@ -199,6 +235,159 @@ function combined(store, fn) {
     } finally {
         if (close && um) um.setCombineCommands(false);
     }
+}
+
+function errMsg(e) {
+    return e && e.message ? e.message : String(e);
+}
+
+// Run `fn` (may be async) as ONE undo step, all-or-nothing. Relies on
+// UndoManager internals (project-editor/store/undo-manager.ts, unchanged
+// 0.28.0-0.29.0):
+//  - setCombineCommands(true) first flushes any pending (uncombined) user
+//    command from um.commands into undoStack, so afterwards um.commands holds
+//    ONLY our commands. Hence: never baseline on undoStack.length — a pending
+//    user edit would make the stack "grow" and we would undo the user's edit.
+//  - nested combined()/addObject/deleteObject/updateObject see
+//    combineCommands === true and leave the group open.
+//  - on failure: close the group (pushes our commands as one undo item), then
+//    undo() it and drop it from redoStack so it can't be redone.
+async function runAtomic(store, fn) {
+    const um = store && store.undoManager;
+    if (!um) throw new Error("project has no undo manager");
+    if (um.combineCommands || um.postponeSetCombineCommandsFalse) {
+        const busy = new Error(
+            "editor busy: another edit is in progress in EEZ Studio (undo group open); retry"
+        );
+        busy.code = "EDITOR_BUSY";
+        throw busy;
+    }
+    um.setCombineCommands(true);
+    try {
+        return await fn();
+    } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        const dirty = um.commands.length > 0;
+        um.setCombineCommands(false);
+        if (dirty) {
+            try {
+                um.undo();
+                um.redoStack.pop();
+            } catch (ue) {
+                err.rollbackError = ue;
+            }
+        }
+        throw err;
+    } finally {
+        // Guarantee the group is closed whatever happened above.
+        if (um.combineCommands) {
+            try {
+                um.setCombineCommands(false);
+            } catch (e) {
+                /* fall through to the hard reset */
+            }
+            if (um.combineCommands) um.combineCommands = false;
+        }
+    }
+}
+
+// --- batch helpers (pure; unit-tested in mcp/test/live-ops.test.js) --------
+// KEEP IN SYNC with resolveRefs / batch validation in mcp/lib/project.js.
+
+const BATCH_OPS = [
+    "addPage",
+    "addWidget",
+    "addActionComponent",
+    "updateWidget",
+    "deleteWidget",
+    "addVariable",
+    "bindWidget",
+    "addEventHandler",
+    "connect",
+    "disconnect"
+];
+// Ops whose result carries the created component's objID (may set `as`).
+const ALIAS_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ALIAS_OPS = ["addWidget", "addActionComponent"];
+// The only arg fields in which "$alias" is substituted.
+const REF_FIELDS = ["objID", "source", "target"];
+const MAX_BATCH_OPS = 200;
+
+function aliasOf(v) {
+    return typeof v === "string" && v.length > 1 && v[0] === "$" ? v.slice(1) : null;
+}
+
+// Return a shallow copy of `args` with objID/source/target values that are
+// exactly "$name" replaced by refs[name]. Throws on an undefined alias.
+function resolveRefs(args, refs) {
+    if (!args || typeof args !== "object") return args;
+    const out = Object.assign({}, args);
+    for (const f of REF_FIELDS) {
+        const a = aliasOf(out[f]);
+        if (a === null) continue;
+        if (!refs || !Object.prototype.hasOwnProperty.call(refs, a)) {
+            throw new Error(`undefined reference "$${a}" in ${f}`);
+        }
+        out[f] = refs[a];
+    }
+    return out;
+}
+
+// Validate a whole batch BEFORE anything is applied. Op numbers in messages
+// are 1-based (#1 = first op). Returns normalized [{ op, args, as }].
+function validateBatch(list) {
+    if (!Array.isArray(list) || list.length === 0) {
+        throw new Error("batch: `ops` must be a non-empty array; nothing applied");
+    }
+    if (list.length > MAX_BATCH_OPS) {
+        throw new Error(
+            `batch: at most ${MAX_BATCH_OPS} ops per batch (got ${list.length}); nothing applied`
+        );
+    }
+    const defined = new Set();
+    return list.map((item, i) => {
+        const name = item && typeof item === "object" ? item.op : undefined;
+        const fail = msg =>
+            new Error(`batch op #${i + 1} (${name || "?"}) invalid: ${msg}; nothing applied`);
+        if (!item || typeof item !== "object") throw fail("must be an object { op, args, as? }");
+        if (!BATCH_OPS.includes(name)) {
+            throw fail(`unsupported op; allowed: ${BATCH_OPS.join(", ")}`);
+        }
+        const args = item.args === undefined ? {} : item.args;
+        if (!args || typeof args !== "object" || Array.isArray(args)) {
+            throw fail("args must be an object");
+        }
+        for (const f of REF_FIELDS) {
+            const a = aliasOf(args[f]);
+            if (a !== null && !defined.has(a)) {
+                throw fail(`${f} references "$${a}", which no earlier op defines with \`as\``);
+            }
+        }
+        if (name === "updateWidget") {
+            try {
+                assertNoReservedProps(args.props);
+            } catch (e) {
+                throw fail(errMsg(e));
+            }
+        }
+        if (item.as !== undefined) {
+            if (typeof item.as !== "string" || !item.as || item.as[0] === "$") {
+                throw fail("`as` must be a non-empty name without a leading $");
+            }
+            if (!ALIAS_RE.test(item.as)) {
+                throw fail(`invalid alias "${item.as}" (use letters, digits, _)`);
+            }
+            if (!ALIAS_OPS.includes(name)) {
+                throw fail(`\`as\` is only supported on ${ALIAS_OPS.join(", ")}`);
+            }
+            if (defined.has(item.as)) throw fail(`duplicate alias "${item.as}"`);
+            defined.add(item.as);
+        }
+        // The batch targets one project; a per-op `project` is ignored.
+        const clean = Object.assign({}, args);
+        delete clean.project;
+        return { op: name, args: clean, as: item.as };
+    });
 }
 
 // --- operations ------------------------------------------------------------
@@ -286,8 +475,8 @@ const ops = {
         };
     },
 
-    async addPage({ project, name, width, height }) {
-        const store = await resolveStore(project);
+    async addPage({ project, name, width, height }, ctx) {
+        const store = await storeFor(project, ctx);
         if (listPagesOf(store).find(p => p.name === name)) {
             throw new Error(`page already exists: ${name}`);
         }
@@ -307,29 +496,30 @@ const ops = {
             PageClass
         );
         combined(store, () => store.addObject(store.project.userPages, page));
-        reveal(store, page);
+        show(ctx, store, page);
         return { added: name };
     },
 
-    async addWidget(args) {
-        return addComponent(args, { defW: 100, defH: 40 });
+    async addWidget(args, ctx) {
+        return addComponent(args, { defW: 100, defH: 40 }, ctx);
     },
 
-    async addActionComponent(args) {
-        return addComponent(args, { defW: 200, defH: 60 });
+    async addActionComponent(args, ctx) {
+        return addComponent(args, { defW: 200, defH: 60 }, ctx);
     },
 
-    async updateWidget({ project, page, objID, props }) {
-        const store = await resolveStore(project);
+    async updateWidget({ project, page, objID, props }, ctx) {
+        assertNoReservedProps(props);
+        const store = await storeFor(project, ctx);
         const pg = findPage(store, page);
         const comp = findByObjID(pg, objID);
         combined(store, () => store.updateObject(comp, props || {}));
-        reveal(store, comp);
+        show(ctx, store, comp);
         return { updated: objID };
     },
 
-    async bindWidget({ project, page, objID, expression }) {
-        const store = await resolveStore(project);
+    async bindWidget({ project, page, objID, expression }, ctx) {
+        const store = await storeFor(project, ctx);
         const pg = findPage(store, page);
         const comp = findByObjID(pg, objID);
         const warnings = [];
@@ -342,15 +532,16 @@ const ops = {
             }
         }
         combined(store, () => store.updateObject(comp, { data: expression }));
-        reveal(store, comp);
+        show(ctx, store, comp);
         return { bound: objID, data: expression, warnings };
     },
 
-    async deleteWidget({ project, page, objID }) {
-        const store = await resolveStore(project);
+    async deleteWidget({ project, page, objID }, ctx) {
+        const store = await storeFor(project, ctx);
         const pg = findPage(store, page);
         const comp = findByObjID(pg, objID);
         combined(store, () => store.deleteObject(comp));
+        if (ctx && ctx.lastShown === comp) ctx.lastShown = null;
         return { deleted: objID };
     },
 
@@ -370,8 +561,8 @@ const ops = {
         };
     },
 
-    async addVariable({ project, name, type, defaultValue, description, persistent }) {
-        const store = await resolveStore(project);
+    async addVariable({ project, name, type, defaultValue, description, persistent }, ctx) {
+        const store = await storeFor(project, ctx);
         const vars = store.project.variables;
         if (!vars || !vars.globalVariables) {
             throw new Error("project has no variables section");
@@ -387,7 +578,7 @@ const ops = {
         if (persistent) js.persistent = true;
         const v = createObject(store, js, VariableClass);
         combined(store, () => store.addObject(vars.globalVariables, v));
-        reveal(store, v);
+        show(ctx, store, v);
         return { added: v.name, type: v.type, defaultValue: v.defaultValue };
     },
 
@@ -403,8 +594,8 @@ const ops = {
         };
     },
 
-    async addEventHandler({ project, page, objID, eventName, handlerType, action }) {
-        const store = await resolveStore(project);
+    async addEventHandler({ project, page, objID, eventName, handlerType, action }, ctx) {
+        const store = await storeFor(project, ctx);
         const pg = findPage(store, page);
         const comp = findByObjID(pg, objID);
         const ht = handlerType || "flow";
@@ -424,12 +615,12 @@ const ops = {
             combined(store, () => store.updateObject(comp, { eventHandlers: [] }));
         }
         combined(store, () => store.addObject(comp.eventHandlers, eh));
-        reveal(store, comp);
+        show(ctx, store, comp);
         return { widget: objID, eventName: js.eventName, handlerType: ht };
     },
 
-    async connect({ project, page, source, output, target, input }) {
-        const store = await resolveStore(project);
+    async connect({ project, page, source, output, target, input }, ctx) {
+        const store = await storeFor(project, ctx);
         const pg = findPage(store, page);
         // Validate both endpoints exist (raises a clear error otherwise).
         findByObjID(pg, source);
@@ -455,8 +646,8 @@ const ops = {
         return { connected: `${source}.${output} -> ${target}.${input}` };
     },
 
-    async disconnect({ project, page, source, output, target, input }) {
-        const store = await resolveStore(project);
+    async disconnect({ project, page, source, output, target, input }, ctx) {
+        const store = await storeFor(project, ctx);
         const pg = findPage(store, page);
         const matches = (pg.connectionLines || []).filter(
             cl =>
@@ -469,6 +660,57 @@ const ops = {
             for (const cl of matches) store.deleteObject(cl);
         });
         return { removed: matches.length };
+    },
+
+    // Apply many authoring ops as ONE undo step, all-or-nothing.
+    //   args: { project?, ops: [{ op, args, as? }] }   (1..MAX_BATCH_OPS ops)
+    //   op is one of BATCH_OPS; `as` (addWidget/addActionComponent only) names the
+    //   created objID so a LATER op can pass "$name" as objID/source/target.
+    //   -> { applied, results: [{ index, op, as?, ...opResult }], refs }
+    // `index` and the "#k" in errors are 1-based. On any failure everything
+    // already applied is rolled back and the error reads
+    // "batch op #k (<op>) failed: <msg>; nothing applied". The store is resolved
+    // once and only the last created/updated object is revealed, after success.
+    async batch({ project, ops: list }, ctx) {
+        const plan = validateBatch(list);
+        const store = await storeFor(project, ctx);
+        const sub = { store, noReveal: true, lastShown: null };
+        const refs = {};
+        const results = [];
+        try {
+            await runAtomic(store, async () => {
+                for (let i = 0; i < plan.length; i++) {
+                    const { op, args, as } = plan[i];
+                    try {
+                        const r = (await ops[op](resolveRefs(args, refs), sub)) || {};
+                        if (as) {
+                            if (!r.objID) throw new Error(`no objID returned for alias "${as}"`);
+                            refs[as] = r.objID;
+                        }
+                        results.push(Object.assign({ index: i + 1, op }, as ? { as } : {}, r));
+                    } catch (e) {
+                        const err = e instanceof Error ? e : new Error(String(e));
+                        err.batchIndex = i;
+                        throw err;
+                    }
+                }
+            });
+        } catch (e) {
+            if (e.code === "EDITOR_BUSY") throw new Error(`batch refused: ${errMsg(e)}; nothing applied`);
+            const where =
+                e.batchIndex !== undefined
+                    ? `batch op #${e.batchIndex + 1} (${plan[e.batchIndex].op}) failed`
+                    : "batch failed";
+            if (e.rollbackError) {
+                throw new Error(
+                    `${where}: ${errMsg(e)}; ROLLBACK FAILED (${errMsg(e.rollbackError)}): ` +
+                        "the editor may hold a partial edit, use Undo in EEZ Studio"
+                );
+            }
+            throw new Error(`${where}: ${errMsg(e)}; nothing applied`);
+        }
+        if (sub.lastShown && !(ctx && ctx.noReveal)) reveal(store, sub.lastShown);
+        return { applied: results.length, results, refs };
     },
 
     async listConnections({ project, page }) {
@@ -546,8 +788,13 @@ const ops = {
     }
 };
 
-async function addComponent({ project, page, type, left, top, width, height, data, props }, defs) {
-    const store = await resolveStore(project);
+async function addComponent(
+    { project, page, type, left, top, width, height, data, props },
+    defs,
+    ctx
+) {
+    assertNoReservedProps(props);
+    const store = await storeFor(project, ctx);
     const pg = findPage(store, page);
     const aClass = classFor(store, type);
     const { createObject } = app().serialization;
@@ -561,7 +808,7 @@ async function addComponent({ project, page, type, left, top, width, height, dat
     if (data !== undefined) js.data = data;
     const comp = createObject(store, js, aClass);
     combined(store, () => store.addObject(pg.components, comp));
-    reveal(store, comp);
+    show(ctx, store, comp);
     return { objID: comp.objID };
 }
 
@@ -644,4 +891,14 @@ async function dispatch(op, args) {
     return await fn(args || {});
 }
 
-module.exports = { dispatch, ops };
+module.exports = {
+    dispatch,
+    ops,
+    // pure helpers, exported for unit tests (mcp/test/live-ops.test.js)
+    resolveRefs,
+    runAtomic,
+    validateBatch,
+    assertNoReservedProps,
+    BATCH_OPS,
+    MAX_BATCH_OPS
+};

@@ -533,3 +533,288 @@ test("validateComponent: unknown type and unknown props", () => {
     assert.equal(r.ok, true);
     assert.deepEqual(r.unknownProps, ["bogus"]);
 });
+
+// ---- reserved props -------------------------------------------------------
+
+test("assertNoReservedProps: objID/type rejected, others and empty ok", () => {
+    assert.throws(() => P.assertNoReservedProps({ objID: "x" }), /reserved field/);
+    assert.throws(() => P.assertNoReservedProps({ type: "x" }), /reserved field/);
+    assert.throws(() => P.assertNoReservedProps({ "objID.x": 1 }), /reserved field\(s\): objID/);
+    assert.throws(() => P.assertNoReservedProps({ "type.y": 1 }), /reserved field/);
+    P.assertNoReservedProps({ left: 1 });
+    P.assertNoReservedProps(undefined);
+    P.assertNoReservedProps({});
+});
+
+test("addActionComponent: reserved props rejected", () => {
+    const proj = projectWithPage();
+    assert.throws(
+        () =>
+            P.addActionComponent(proj, {
+                page: "Main",
+                type: "SetVariableActionComponent",
+                props: { type: "Evil" }
+            }),
+        /reserved field/
+    );
+});
+
+// ---- resolveRefs ----------------------------------------------------------
+
+test("resolveRefs: replaces only objID/source/target, not mutating args", () => {
+    const args = {
+        objID: "$a",
+        source: "$a",
+        target: "$b",
+        output: "$a",
+        props: { objID: "$a" }
+    };
+    const out = P.resolveRefs(args, { a: "AAA", b: "BBB" });
+    assert.deepEqual(out, {
+        objID: "AAA",
+        source: "AAA",
+        target: "BBB",
+        output: "$a",
+        props: { objID: "$a" }
+    });
+    assert.equal(args.objID, "$a");
+    assert.equal(P.resolveRefs({ objID: "real-id" }, {}).objID, "real-id");
+});
+
+test("resolveRefs: undefined alias throws", () => {
+    assert.throws(
+        () => P.resolveRefs({ source: "$nope" }, { a: "x" }),
+        /undefined alias/
+    );
+    assert.throws(
+        () => P.resolveRefs({ source: "$constructor" }, {}),
+        /undefined alias/
+    );
+});
+
+// ---- applyBatch -----------------------------------------------------------
+
+test("applyBatch: widget + action + connect via aliases, one result set", () => {
+    const proj = projectWithPage();
+    const res = P.applyBatch(proj, [
+        { tool: "add_variable", args: { name: "n", type: "integer" } },
+        {
+            tool: "add_widget",
+            as: "btn",
+            args: { page: "Main", type: "ButtonDashboardWidget" }
+        },
+        {
+            tool: "add_action_component",
+            as: "act",
+            args: { page: "Main", type: "SetVariableActionComponent" }
+        },
+        {
+            tool: "bind_widget",
+            args: { page: "Main", objID: "$btn", expression: "n" }
+        },
+        {
+            tool: "connect",
+            args: {
+                page: "Main",
+                source: "$btn",
+                output: "CLICKED",
+                target: "$act",
+                input: "@seqin"
+            }
+        }
+    ]);
+    assert.equal(res.applied, 5);
+    assert.deepEqual(Object.keys(res.refs), ["btn", "act"]);
+    assert.match(res.refs.btn, UUID_RE);
+    assert.deepEqual(
+        res.results.map(r => [r.index, r.tool, r.as]),
+        [
+            [1, "add_variable", undefined],
+            [2, "add_widget", "btn"],
+            [3, "add_action_component", "act"],
+            [4, "bind_widget", undefined],
+            [5, "connect", undefined]
+        ]
+    );
+    assert.equal(res.results[1].objID, res.refs.btn);
+    // project was updated in place
+    const page = P.findPage(proj, "Main");
+    assert.equal(page.components.length, 2);
+    assert.equal(page.components[0].data, "n");
+    assert.deepEqual(page.connectionLines, [
+        {
+            source: res.refs.btn,
+            output: "CLICKED",
+            target: res.refs.act,
+            input: "@seqin",
+            disabled: false
+        }
+    ]);
+    assert.equal(proj.variables.globalVariables.length, 1);
+});
+
+test("applyBatch: failure at op k throws and leaves project deep-equal", () => {
+    const proj = projectWithPage();
+    P.addVariable(proj, { name: "keep", type: "string" });
+    const before = structuredClone(proj);
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                { tool: "add_page", args: { name: "Second" } },
+                {
+                    tool: "add_widget",
+                    as: "w",
+                    args: { page: "Main", type: "T" }
+                },
+                { tool: "add_variable", args: { name: "keep", type: "string" } },
+                { tool: "add_page", args: { name: "Third" } }
+            ]),
+        /^Error: batch op #3 \(add_variable\) failed: .*already exists.*; nothing applied$/
+    );
+    assert.deepEqual(proj, before);
+});
+
+test("applyBatch: runtime failure in connect (unknown endpoint) reports index", () => {
+    const proj = projectWithPage();
+    const before = structuredClone(proj);
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                {
+                    tool: "add_widget",
+                    as: "w",
+                    args: { page: "Main", type: "T" }
+                },
+                {
+                    tool: "connect",
+                    args: {
+                        page: "Main",
+                        source: "$w",
+                        output: "o",
+                        target: "ghost",
+                        input: "i"
+                    }
+                }
+            ]),
+        /batch op #2 \(connect\) failed: .*target component not found.*nothing applied/
+    );
+    assert.deepEqual(proj, before);
+});
+
+test("applyBatch: undefined, forward and duplicate aliases rejected upfront", () => {
+    const proj = projectWithPage();
+    const before = structuredClone(proj);
+    const w = as => ({
+        tool: "add_widget",
+        as,
+        args: { page: "Main", type: "T" }
+    });
+    // undefined alias
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                { tool: "delete_widget", args: { page: "Main", objID: "$ghost" } }
+            ]),
+        /batch op #1 .*undefined alias \$ghost/
+    );
+    // forward reference (alias defined by a LATER op)
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                {
+                    tool: "bind_widget",
+                    args: { page: "Main", objID: "$w", expression: "x" }
+                },
+                w("w")
+            ]),
+        /batch op #1 .*undefined alias \$w/
+    );
+    // duplicate alias
+    assert.throws(
+        () => P.applyBatch(proj, [w("a"), w("a")]),
+        /duplicate alias "a"/
+    );
+    // `as` on non-creating op, bad alias syntax, unknown tool
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                { tool: "add_page", as: "p", args: { name: "X" } }
+            ]),
+        /`as` is only allowed/
+    );
+    assert.throws(() => P.applyBatch(proj, [w("1bad")]), /invalid alias/);
+    assert.throws(
+        () => P.applyBatch(proj, [{ tool: "nope", args: {} }]),
+        /batch op #1 \(nope\) invalid: unknown tool/
+    );
+    assert.deepEqual(proj, before);
+});
+
+test("applyBatch: 0 and >200 ops rejected; 200 accepted", () => {
+    const proj = projectWithPage();
+    const op = i => ({
+        tool: "add_variable",
+        args: { name: `v${i}`, type: "integer" }
+    });
+    assert.throws(() => P.applyBatch(proj, []), /needs 1-200 ops/);
+    assert.throws(
+        () => P.applyBatch(proj, Array.from({ length: 201 }, (_, i) => op(i))),
+        /needs 1-200 ops/
+    );
+    assert.equal(proj.variables.globalVariables.length, 0);
+    const res = P.applyBatch(
+        proj,
+        Array.from({ length: 200 }, (_, i) => op(i))
+    );
+    assert.equal(res.applied, 200);
+    assert.equal(proj.variables.globalVariables.length, 200);
+});
+
+test("applyBatch: reserved props rejected in add_widget and update_widget", () => {
+    const proj = projectWithPage();
+    const id = P.addWidget(proj, { page: "Main", type: "T" });
+    const before = structuredClone(proj);
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                {
+                    tool: "add_widget",
+                    args: { page: "Main", type: "T", props: { objID: "x" } }
+                }
+            ]),
+        /batch op #1 \(add_widget\) invalid: .*reserved field/
+    );
+    assert.throws(
+        () =>
+            P.applyBatch(proj, [
+                {
+                    tool: "update_widget",
+                    args: { page: "Main", objID: id, props: { type: "Evil" } }
+                }
+            ]),
+        /batch op #1 \(update_widget\) invalid: .*reserved field/
+    );
+    assert.deepEqual(proj, before);
+});
+
+test("applyBatch: does not mutate op args or share nested props with project", () => {
+    const proj = projectWithPage();
+    const props = { style: { a: 1 } };
+    const ops = [
+        {
+            tool: "add_widget",
+            as: "w",
+            args: { page: "Main", type: "T", props }
+        },
+        {
+            tool: "update_widget",
+            args: { page: "Main", objID: "$w", props: { left: 5 } }
+        }
+    ];
+    const opsCopy = structuredClone(ops);
+    P.applyBatch(proj, ops);
+    assert.deepEqual(ops, opsCopy);
+    props.style.a = 2;
+    assert.equal(P.findPage(proj, "Main").components[0].style.a, 1);
+    assert.equal(P.findPage(proj, "Main").components[0].left, 5);
+});

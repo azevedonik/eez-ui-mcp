@@ -31,7 +31,7 @@ eez-ui MCP  ──HTTP 127.0.0.1 (+token)──▶  eez-ui-bridge (this extensio
 ## Install
 
 The extension is plain JavaScript with **no dependencies** and needs no build,
-so installing on **any** EEZ Studio (0.28.x) is just "put the folder in the
+so installing on **any** EEZ Studio (0.28.x–0.29.x (tested on 0.29.0)) is just "put the folder in the
 extensions directory". EEZ Studio loads every sub-folder of its user-data
 `extensions/` directory at startup.
 

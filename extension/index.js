@@ -28,8 +28,26 @@ const crypto = require("crypto");
 
 const DEFAULT_PORT = parseInt(process.env.EEZ_BRIDGE_PORT || "38011", 10);
 
+// Max request body size; a runaway client gets a 413 instead of exhausting memory.
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+
 // Both the extension (renderer) and the external MCP compute this same path.
 const DISCOVERY_FILE = path.join(os.tmpdir(), "eez-ui-bridge.json");
+
+// Capabilities the MCP can probe for (via /ping or the discovery file).
+const FEATURES = ["batch"];
+
+// The bridge's own version comes from the extension package.json (single source
+// of truth); the MCP compares it against the version it requires.
+const BRIDGE_VERSION = (() => {
+    try {
+        return JSON.parse(
+            fs.readFileSync(path.join(__dirname, "package.json"), "utf8")
+        ).version;
+    } catch (e) {
+        return null;
+    }
+})();
 
 function log(...args) {
     try {
@@ -70,25 +88,74 @@ function activeProjectInfo() {
     };
 }
 
+// EEZ Studio app version (e.g. "0.29.0"), or null if it can't be resolved.
+// Cached once found; lookups are cheap but /ping is hit often.
+let studioVersionCache = null;
+
+function studioVersion() {
+    if (studioVersionCache) return studioVersionCache;
+    try {
+        let remote = null;
+        if (typeof EEZStudio !== "undefined" && EEZStudio && EEZStudio.remote) {
+            remote = EEZStudio.remote;
+        } else {
+            try {
+                remote = require("@electron/remote");
+            } catch (e) {
+                // Not on the extension's require path: resolve via the app's node_modules.
+                const p = require.resolve("home/tabs-store"); // <repo>/build/home/tabs-store.js
+                const appModules = path.join(
+                    path.dirname(path.dirname(path.dirname(p))),
+                    "node_modules"
+                );
+                remote = require(require.resolve("@electron/remote", {
+                    paths: [appModules]
+                }));
+            }
+        }
+        studioVersionCache = remote.app.getVersion() || null;
+    } catch (e) {
+        studioVersionCache = null;
+    }
+    return studioVersionCache;
+}
+
 // --- server ----------------------------------------------------------------
 
 let server = null;
 let token = null;
+let unloadHooked = false;
 
 function startServer() {
     if (server) return;
 
     token = crypto.randomBytes(24).toString("hex");
+    hookUnload();
 
     server = http.createServer((req, res) => {
-        let body = "";
+        // Collect raw bytes and decode once at the end: concatenating chunks as
+        // strings corrupts multibyte UTF-8 characters split across chunks.
+        const chunks = [];
+        let size = 0;
+        let tooLarge = false;
         req.on("data", chunk => {
-            body += chunk;
-            if (body.length > 16 * 1024 * 1024) req.destroy(); // 16 MB cap
+            if (tooLarge) return;
+            size += chunk.length;
+            if (size > MAX_BODY_BYTES) {
+                // Stop buffering but keep reading (discarding) so the client can
+                // finish sending and then read the single 413 instead of EPIPE.
+                tooLarge = true;
+                chunks.length = 0;
+                req.resume();
+                send(res, 413, { ok: false, error: "request body too large" });
+                return;
+            }
+            chunks.push(chunk);
         });
         req.on("end", () => {
+            if (tooLarge) return;
             try {
-                handle(req, res, body);
+                handle(req, res, Buffer.concat(chunks).toString("utf8"));
             } catch (e) {
                 send(res, 500, { ok: false, error: errString(e) });
             }
@@ -120,9 +187,34 @@ function stopServer() {
         }
         server = null;
     }
+    removeDiscovery();
+}
+
+// Remove the discovery file, but only if it is ours (same pid + token): another
+// Studio window/instance may have overwritten it since. Idempotent and
+// exception-safe, so it can run from both destroy() and the window unload hooks.
+function removeDiscovery() {
     try {
         const disc = readDiscovery();
-        if (disc && disc.pid === process.pid) fs.rmSync(DISCOVERY_FILE, { force: true });
+        if (disc && disc.pid === process.pid && token && disc.token === token) {
+            fs.rmSync(DISCOVERY_FILE, { force: true });
+        }
+    } catch (e) {
+        /* ignore */
+    }
+}
+
+// destroy() is not called when the user simply quits Studio, which would leave a
+// stale discovery file behind; clean up when the renderer window goes away.
+// `unload`/`pagehide` (not `beforeunload`, which can be cancelled).
+function hookUnload() {
+    if (unloadHooked) return;
+    try {
+        if (typeof window !== "undefined" && window.addEventListener) {
+            window.addEventListener("unload", removeDiscovery);
+            window.addEventListener("pagehide", removeDiscovery);
+            unloadHooked = true;
+        }
     } catch (e) {
         /* ignore */
     }
@@ -130,14 +222,20 @@ function stopServer() {
 
 function writeDiscovery() {
     try {
+        // `mode` is applied on file creation and only honoured on POSIX; on
+        // Windows it is ignored (the file inherits the temp dir's ACL).
         fs.writeFileSync(
             DISCOVERY_FILE,
             JSON.stringify({
                 port: DEFAULT_PORT,
                 token: token,
                 pid: process.pid,
+                bridgeVersion: BRIDGE_VERSION,
+                studioVersion: studioVersion(),
+                features: FEATURES,
                 ts: Date.now()
-            })
+            }),
+            { mode: 0o600 }
         );
     } catch (e) {
         log("discovery write failed", e && e.message);
@@ -178,7 +276,10 @@ function handle(req, res, body) {
         return send(res, 200, {
             ok: true,
             processType: typeof process !== "undefined" ? process.type : null,
-            version: "0.1.0"
+            version: BRIDGE_VERSION,
+            bridgeVersion: BRIDGE_VERSION,
+            studioVersion: studioVersion(),
+            features: FEATURES
         });
     }
 

@@ -13,6 +13,7 @@
 // (render design/run to PNG) + build/validate verification.
 import fs from "fs";
 import path from "path";
+import { createRequire } from "module";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -84,7 +85,131 @@ function getSchema() {
     return backend.schema();
 }
 
-const server = new McpServer({ name: "eez-ui", version: "0.2.0" });
+// ---- shared input shapes for the mutating tools ---------------------------
+//
+// Raw zod shapes WITHOUT `project`. Each single tool registers
+// { project, ...TOOL_SHAPES[name] }; `batch` validates every op's args against
+// z.object(TOOL_SHAPES[tool]).strict() (the batch targets one project).
+const TOOL_SHAPES = {
+    add_page: {
+        name: z.string(),
+        width: z.number().optional(),
+        height: z.number().optional()
+    },
+    add_widget: {
+        page: z.string(),
+        type: z.string().describe('e.g. "TextDashboardWidget"'),
+        left: z.number(),
+        top: z.number(),
+        width: z.number(),
+        height: z.number(),
+        data: z.string().optional(),
+        props: z.record(z.any()).optional()
+    },
+    update_widget: {
+        page: z.string(),
+        objID: z.string(),
+        props: z.record(z.any())
+    },
+    delete_widget: {
+        page: z.string(),
+        objID: z.string()
+    },
+    add_variable: {
+        name: z.string(),
+        type: z.string().optional(),
+        defaultValue: z.string().optional(),
+        description: z.string().optional(),
+        persistent: z.boolean().optional()
+    },
+    bind_widget: {
+        page: z.string(),
+        objID: z.string(),
+        expression: z.string()
+    },
+    add_action_component: {
+        page: z.string(),
+        type: z.string(),
+        left: z.number(),
+        top: z.number(),
+        width: z.number().optional(),
+        height: z.number().optional(),
+        props: z.record(z.any()).optional()
+    },
+    add_event_handler: {
+        page: z.string(),
+        objID: z.string(),
+        eventName: z.string().optional(),
+        handlerType: z.enum(["flow", "action"]).optional(),
+        action: z.string().optional()
+    },
+    connect: {
+        page: z.string(),
+        source: z.string().describe("source component objID"),
+        output: z.string(),
+        target: z.string().describe("target component objID"),
+        input: z.string()
+    },
+    disconnect: {
+        page: z.string(),
+        source: z.string(),
+        output: z.string(),
+        target: z.string(),
+        input: z.string()
+    }
+};
+
+for (const name of P.BATCH_TOOL_NAMES) {
+    if (!TOOL_SHAPES[name]) throw new Error(`TOOL_SHAPES is missing "${name}"`);
+}
+
+// Input shape of a single mutating tool: optional project + the shared shape.
+function toolShape(name) {
+    return { project: z.string().optional(), ...TOOL_SHAPES[name] };
+}
+
+// Checks shared by the single tools and every batch op, run before anything is
+// sent: reserved props (objID/type) and, for component-creating tools, the
+// shipped component catalog. Returns { args, warning? } where args is what the
+// backend receives; throws with a user-facing message.
+async function prepare(tool, a) {
+    switch (tool) {
+        case "add_widget":
+        case "add_action_component": {
+            const props = a.props || {};
+            P.assertNoReservedProps(props);
+            const check = P.validateComponent(await getSchema(), a.type, props);
+            if (!check.ok) throw new Error(check.error);
+            const args = { ...a, props };
+            const warning =
+                tool === "add_widget" && check.unknownProps && check.unknownProps.length
+                    ? `unknown props: ${check.unknownProps.join(", ")}`
+                    : undefined;
+            return { args, warning };
+        }
+        case "update_widget":
+            P.assertNoReservedProps(a.props);
+            return { args: a };
+        default:
+            return { args: a };
+    }
+}
+
+// Strip `project` (handled by resolveProject) from a single tool's args.
+function withoutProject({ project, ...rest }) {
+    return rest;
+}
+
+function zodIssues(error) {
+    return error.issues
+        .map(i => `${i.path.length ? i.path.join(".") : "args"}: ${i.message}`)
+        .join("; ");
+}
+
+const require = createRequire(import.meta.url);
+const { version: SERVER_VERSION } = require("./package.json");
+
+const server = new McpServer({ name: "eez-ui", version: SERVER_VERSION });
 
 // ---- project lifecycle ----------------------------------------------------
 
@@ -102,7 +227,8 @@ server.registerTool(
     handler(async ({ path: p, displayWidth, displayHeight }) => {
         const r = await backend.createDashboard(p, { displayWidth, displayHeight });
         activeProject = p;
-        return text({ ...r, active: true, live: !!(await backend.isLive()) });
+        const status = await backend.bridgeStatus(); // { studioVersion, bridgeVersion, warning? }
+        return text({ ...r, active: true, live: !!status, ...(status || {}) });
     })
 );
 
@@ -129,10 +255,12 @@ server.registerTool(
         }
         activeProject = p;
         const openedLive = await backend.openInEditor(p);
+        const status = openedLive ? await backend.bridgeStatus() : null;
         return text({
             active: p,
             projectType: type || "dashboard",
-            via: openedLive ? "live-editor" : "file"
+            via: openedLive ? "live-editor" : "file",
+            ...(status || {})
         });
     })
 );
@@ -169,16 +297,11 @@ server.registerTool(
     "add_page",
     {
         description: "Add a page (screen) to the project.",
-        inputSchema: {
-            project: z.string().optional(),
-            name: z.string(),
-            width: z.number().optional(),
-            height: z.number().optional()
-        }
+        inputSchema: toolShape("add_page")
     },
-    handler(async ({ project, name, width, height }) => {
-        const p = resolveProject(project);
-        return text(await backend.addPage(p, { name, width, height }));
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.addPage(p, withoutProject(a)));
     })
 );
 
@@ -199,55 +322,28 @@ server.registerTool(
     "add_widget",
     {
         description:
-            "Add a widget to a page. `data` is an expression: a bare name binds to a variable, quoted text is a literal. Returns the new widget objID.",
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            type: z.string().describe('e.g. "TextDashboardWidget"'),
-            left: z.number(),
-            top: z.number(),
-            width: z.number(),
-            height: z.number(),
-            data: z.string().optional(),
-            props: z.record(z.any()).optional()
-        }
+            "Add a widget to a page. `data` is an expression: a bare name binds to a variable, quoted text is a literal. Returns the new widget objID. To build several widgets/flows at once, prefer `batch`.",
+        inputSchema: toolShape("add_widget")
     },
-    handler(async ({ project, page, type, left, top, width, height, data, props }) => {
-        const p = resolveProject(project);
-        const check = P.validateComponent(await getSchema(), type, props || {});
-        if (!check.ok) return fail(check.error);
-        const r = await backend.addWidget(p, {
-            page,
-            type,
-            left,
-            top,
-            width,
-            height,
-            data,
-            props: props || {}
-        });
-        const warn =
-            check.unknownProps && check.unknownProps.length
-                ? { warning: `unknown props: ${check.unknownProps.join(", ")}` }
-                : {};
-        return text({ ...r, ...warn });
+    handler(async a => {
+        const p = resolveProject(a.project);
+        const { args, warning } = await prepare("add_widget", withoutProject(a));
+        const r = await backend.addWidget(p, args);
+        return text(warning ? { ...r, warning } : r);
     })
 );
 
 server.registerTool(
     "update_widget",
     {
-        description: "Update properties of a widget/component by objID.",
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            objID: z.string(),
-            props: z.record(z.any())
-        }
+        description:
+            "Update properties of a widget/component by objID (`objID` and `type` cannot be changed via props).",
+        inputSchema: toolShape("update_widget")
     },
-    handler(async ({ project, page, objID, props }) => {
-        const p = resolveProject(project);
-        return text(await backend.updateWidget(p, { page, objID, props }));
+    handler(async a => {
+        const p = resolveProject(a.project);
+        const { args } = await prepare("update_widget", withoutProject(a));
+        return text(await backend.updateWidget(p, args));
     })
 );
 
@@ -256,15 +352,11 @@ server.registerTool(
     {
         description:
             "Delete a widget/component by objID (also removes its connection lines).",
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            objID: z.string()
-        }
+        inputSchema: toolShape("delete_widget")
     },
-    handler(async ({ project, page, objID }) => {
-        const p = resolveProject(project);
-        return text(await backend.deleteWidget(p, { page, objID }));
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.deleteWidget(p, withoutProject(a)));
     })
 );
 
@@ -286,26 +378,11 @@ server.registerTool(
     {
         description:
             "Add a global variable. type e.g. integer/float/double/boolean/string/json/any, or enum:Name / struct:Name / array:T. defaultValue is an expression string.",
-        inputSchema: {
-            project: z.string().optional(),
-            name: z.string(),
-            type: z.string().optional(),
-            defaultValue: z.string().optional(),
-            description: z.string().optional(),
-            persistent: z.boolean().optional()
-        }
+        inputSchema: toolShape("add_variable")
     },
-    handler(async ({ project, name, type, defaultValue, description, persistent }) => {
-        const p = resolveProject(project);
-        return text(
-            await backend.addVariable(p, {
-                name,
-                type,
-                defaultValue,
-                description,
-                persistent
-            })
-        );
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.addVariable(p, withoutProject(a)));
     })
 );
 
@@ -325,16 +402,11 @@ server.registerTool(
     {
         description:
             'Bind a widget\'s data input to an expression (a bare name maps to a variable, e.g. "counter"; quoted text is a literal, e.g. "\\"hi\\"").',
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            objID: z.string(),
-            expression: z.string()
-        }
+        inputSchema: toolShape("bind_widget")
     },
-    handler(async ({ project, page, objID, expression }) => {
-        const p = resolveProject(project);
-        return text(await backend.bindWidget(p, { page, objID, expression }));
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.bindWidget(p, withoutProject(a)));
     })
 );
 
@@ -345,32 +417,12 @@ server.registerTool(
     {
         description:
             'Add a flow action component (e.g. "SetVariableActionComponent" with props {entries:[{variable,value}]}). Returns its objID.',
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            type: z.string(),
-            left: z.number(),
-            top: z.number(),
-            width: z.number().optional(),
-            height: z.number().optional(),
-            props: z.record(z.any()).optional()
-        }
+        inputSchema: toolShape("add_action_component")
     },
-    handler(async ({ project, page, type, left, top, width, height, props }) => {
-        const p = resolveProject(project);
-        const check = P.validateComponent(await getSchema(), type, props || {});
-        if (!check.ok) return fail(check.error);
-        return text(
-            await backend.addActionComponent(p, {
-                page,
-                type,
-                left,
-                top,
-                width,
-                height,
-                props: props || {}
-            })
-        );
+    handler(async a => {
+        const p = resolveProject(a.project);
+        const { args } = await prepare("add_action_component", withoutProject(a));
+        return text(await backend.addActionComponent(p, args));
     })
 );
 
@@ -379,26 +431,11 @@ server.registerTool(
     {
         description:
             'Add an event handler to a widget. handlerType "flow" creates an output pin named eventName (e.g. "CLICKED") to wire with connect(); "action" invokes a named action directly.',
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            objID: z.string(),
-            eventName: z.string().optional(),
-            handlerType: z.enum(["flow", "action"]).optional(),
-            action: z.string().optional()
-        }
+        inputSchema: toolShape("add_event_handler")
     },
-    handler(async ({ project, page, objID, eventName, handlerType, action }) => {
-        const p = resolveProject(project);
-        return text(
-            await backend.addEventHandler(p, {
-                page,
-                objID,
-                eventName,
-                handlerType,
-                action
-            })
-        );
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.addEventHandler(p, withoutProject(a)));
     })
 );
 
@@ -407,20 +444,11 @@ server.registerTool(
     {
         description:
             'Add a flow connection line from a source component output pin to a target component input pin. Pins: widget event outputs (e.g. "CLICKED"), action sequence pins "@seqout"/"@seqin", or named data pins.',
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            source: z.string().describe("source component objID"),
-            output: z.string(),
-            target: z.string().describe("target component objID"),
-            input: z.string()
-        }
+        inputSchema: toolShape("connect")
     },
-    handler(async ({ project, page, source, output, target, input }) => {
-        const p = resolveProject(project);
-        return text(
-            await backend.connect(p, { page, source, output, target, input })
-        );
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.connect(p, withoutProject(a)));
     })
 );
 
@@ -429,20 +457,11 @@ server.registerTool(
     {
         description:
             "Remove a flow connection line matching source/output/target/input. Returns how many were removed.",
-        inputSchema: {
-            project: z.string().optional(),
-            page: z.string(),
-            source: z.string(),
-            output: z.string(),
-            target: z.string(),
-            input: z.string()
-        }
+        inputSchema: toolShape("disconnect")
     },
-    handler(async ({ project, page, source, output, target, input }) => {
-        const p = resolveProject(project);
-        return text(
-            await backend.disconnect(p, { page, source, output, target, input })
-        );
+    handler(async a => {
+        const p = resolveProject(a.project);
+        return text(await backend.disconnect(p, withoutProject(a)));
     })
 );
 
@@ -455,6 +474,61 @@ server.registerTool(
     handler(async ({ project, page }) =>
         text(await backend.listConnections(resolveProject(project), { page }))
     )
+);
+
+// ---- batch ----------------------------------------------------------------
+
+server.registerTool(
+    "batch",
+    {
+        description:
+            "Apply many authoring ops in ONE call, all-or-nothing. PREFER this over individual calls when building or changing a screen: far fewer tool calls, and live it is a single undo step in EEZ Studio. " +
+            "ops: 1-200 entries run in order, each { tool, args, as? } where tool is one of " +
+            P.BATCH_TOOL_NAMES.join(", ") +
+            " and args are exactly that tool's arguments without `project`. " +
+            'An add_widget / add_action_component op may set as:"btn"; a LATER op can then pass "$btn" as objID, source or target and it is replaced with the created objID (no other field is substituted). ' +
+            "Every op is validated before anything is applied; any failure returns `batch op #k (tool) ...; nothing applied`. " +
+            "Returns { via, applied, results:[{index, tool, as?, ...}], refs:{alias: objID} }.",
+        inputSchema: {
+            project: z.string().optional(),
+            ops: z
+                .array(
+                    z.object({
+                        tool: z.enum(P.BATCH_TOOL_NAMES),
+                        args: z.record(z.any()),
+                        as: z
+                            .string()
+                            .regex(/^[A-Za-z_][A-Za-z0-9_]*$/, "alias must use letters, digits, _ and not start with a digit")
+                            .optional()
+                    })
+                )
+                .min(1)
+                .max(200)
+        }
+    },
+    handler(async ({ project, ops }) => {
+        const p = resolveProject(project);
+        const prepared = [];
+        const warnings = [];
+        for (let i = 0; i < ops.length; i++) {
+            const { tool, args, as } = ops[i];
+            const where = `batch op #${i + 1} (${tool})`;
+            const parsed = z.object(TOOL_SHAPES[tool]).strict().safeParse(args);
+            if (!parsed.success) {
+                throw new Error(`${where} invalid: ${zodIssues(parsed.error)}; nothing applied`);
+            }
+            let prep;
+            try {
+                prep = await prepare(tool, parsed.data);
+            } catch (e) {
+                throw new Error(`${where} invalid: ${e.message}; nothing applied`);
+            }
+            if (prep.warning) warnings.push(`op #${i + 1}: ${prep.warning}`);
+            prepared.push({ tool, args: prep.args, ...(as !== undefined ? { as } : {}) });
+        }
+        const r = await backend.batch(p, prepared);
+        return text(warnings.length ? { ...r, warnings } : r);
+    })
 );
 
 // ---- visualize + verify ---------------------------------------------------

@@ -94,9 +94,16 @@ function findComponent(page, objID) {
     return c;
 }
 
-function assertNoReservedProps(props) {
-    if (!props) return;
-    const offending = RESERVED_PROPS.filter(k => k in props);
+/**
+ * Throw if `props` tries to set identity fields (objID / type). Shared by
+ * addWidget / addActionComponent / updateWidget and by the MCP layer.
+ * @param {object} [props]
+ */
+export function assertNoReservedProps(props) {
+    if (!props || typeof props !== "object") return;
+    const offending = RESERVED_PROPS.filter(r =>
+        Object.keys(props).some(k => k.split(".")[0] === r)
+    );
     if (offending.length) {
         throw new Error(
             `props may not set reserved field(s): ${offending.join(", ")}`
@@ -335,6 +342,199 @@ export function listConnections(project, { page }) {
         target: cl.target,
         input: cl.input
     }));
+}
+
+// ---- batch ----------------------------------------------------------------
+
+// Top-level arg fields in which "$alias" references are substituted.
+const REF_FIELDS = ["objID", "source", "target"];
+const MAX_BATCH_OPS = 200;
+const ALIAS_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+// Does `v` look like an alias reference ("$name")?
+function isRef(v) {
+    return typeof v === "string" && v.startsWith("$");
+}
+
+/**
+ * Replace "$alias" strings in the objID / source / target fields of `args`
+ * (top level only) with the objID recorded in `refs`. Returns a shallow copy;
+ * `args` is not mutated.
+ * keep in sync with extension/live-ops.js resolveRefs
+ * @param {object} args
+ * @param {Record<string,string>} refs alias -> objID
+ * @throws if a reference names an undefined alias
+ */
+export function resolveRefs(args, refs) {
+    const out = { ...args };
+    for (const f of REF_FIELDS) {
+        const v = out[f];
+        if (!isRef(v)) continue;
+        const alias = v.slice(1);
+        if (!Object.prototype.hasOwnProperty.call(refs || {}, alias)) {
+            throw new Error(`undefined alias: ${v}`);
+        }
+        out[f] = refs[alias];
+    }
+    return out;
+}
+
+// MCP tool name -> { run(project, args) => result, creates } using the same
+// functions (and result shapes) the file backend returns per tool.
+const BATCH_TOOLS = {
+    add_page: {
+        run: (p, a) => ({ added: addPage(p, a).name })
+    },
+    add_widget: {
+        creates: true,
+        run: (p, a) => ({ objID: addWidget(p, a) })
+    },
+    add_action_component: {
+        creates: true,
+        run: (p, a) => ({ objID: addActionComponent(p, a) })
+    },
+    update_widget: {
+        run: (p, a) => {
+            updateWidget(p, a);
+            return { updated: a.objID };
+        }
+    },
+    delete_widget: {
+        run: (p, a) => {
+            deleteWidget(p, a);
+            return { deleted: a.objID };
+        }
+    },
+    add_variable: {
+        run: (p, a) => {
+            const v = addVariable(p, a);
+            return { added: v.name, type: v.type, defaultValue: v.defaultValue };
+        }
+    },
+    bind_widget: {
+        run: (p, a) => {
+            bindWidget(p, a);
+            return { bound: a.objID, data: a.expression };
+        }
+    },
+    add_event_handler: {
+        run: (p, a) => ({ widget: a.objID, ...addEventHandler(p, a) })
+    },
+    connect: {
+        run: (p, a) => ({
+            connected: `${a.source}.${a.output} -> ${a.target}.${a.input}`,
+            line: connect(p, a)
+        })
+    },
+    disconnect: {
+        run: (p, a) => ({ removed: disconnect(p, a) })
+    }
+};
+
+/** Tool names accepted by applyBatch. */
+export const BATCH_TOOL_NAMES = Object.keys(BATCH_TOOLS);
+
+// Upfront validation; throws before anything is applied.
+function validateBatch(ops) {
+    if (!Array.isArray(ops) || ops.length < 1 || ops.length > MAX_BATCH_OPS) {
+        throw new Error(
+            `batch needs 1-${MAX_BATCH_OPS} ops (got ${
+                Array.isArray(ops) ? ops.length : typeof ops
+            }); nothing applied`
+        );
+    }
+    const defined = new Set();
+    ops.forEach((op, i) => {
+        const k = i + 1;
+        const bad = msg => {
+            throw new Error(
+                `batch op #${k} (${op && op.tool}) invalid: ${msg}; nothing applied`
+            );
+        };
+        if (!op || typeof op !== "object") bad("op must be an object");
+        const def = BATCH_TOOLS[op.tool];
+        if (!def) {
+            bad(`unknown tool (allowed: ${BATCH_TOOL_NAMES.join(", ")})`);
+        }
+        const args = op.args === undefined ? {} : op.args;
+        if (!args || typeof args !== "object" || Array.isArray(args)) {
+            bad("args must be an object");
+        }
+        try {
+            assertNoReservedProps(args.props);
+        } catch (e) {
+            bad(e.message);
+        }
+        // References must name an alias defined by an EARLIER op.
+        for (const f of REF_FIELDS) {
+            if (isRef(args[f]) && !defined.has(args[f].slice(1))) {
+                bad(`${f} references undefined alias ${args[f]}`);
+            }
+        }
+        if (op.as !== undefined) {
+            if (!def.creates) {
+                bad("`as` is only allowed on add_widget / add_action_component");
+            }
+            if (typeof op.as !== "string" || !ALIAS_RE.test(op.as)) {
+                bad(`invalid alias "${op.as}" (use letters, digits, _)`);
+            }
+            if (defined.has(op.as)) bad(`duplicate alias "${op.as}"`);
+            defined.add(op.as);
+        }
+    });
+}
+
+/**
+ * Apply several authoring ops atomically to `project`.
+ *
+ * ops: [{ tool, args, as? }] with `tool` an MCP tool name (BATCH_TOOL_NAMES)
+ * and `args` that tool's args minus `project`. Creating ops (add_widget,
+ * add_action_component) may set `as: "name"`; later ops can then pass
+ * "$name" in objID / source / target.
+ *
+ * All ops run against one structuredClone of the project. Only if every op
+ * succeeds is the result copied back into `project` IN PLACE (so the caller
+ * can save once); on any failure `project` is left untouched and an Error
+ * `batch op #k (<tool>) failed: <msg>; nothing applied` (k 1-based) is thrown.
+ * Upfront validation errors (1-200 ops, unknown tool, duplicate/undefined/
+ * forward alias, reserved props) are thrown before anything runs.
+ *
+ * @param {Project} project mutated only on full success
+ * @param {{tool:string,args?:object,as?:string}[]} ops
+ * @returns {{applied:number,
+ *            results:{index:number,tool:string,as?:string}[],
+ *            refs:Record<string,string>}}
+ *   results[i] = { index (1-based), tool, as?, ...the per-tool result the
+ *   file backend returns, e.g. { objID } / { updated } / { connected, line } };
+ *   refs maps alias -> resulting objID.
+ */
+export function applyBatch(project, ops) {
+    validateBatch(ops);
+    const work = structuredClone(project);
+    const refs = {};
+    const results = [];
+    ops.forEach((op, i) => {
+        const k = i + 1;
+        try {
+            const args = structuredClone(resolveRefs(op.args || {}, refs));
+            const def = BATCH_TOOLS[op.tool];
+            const result = def.run(work, args);
+            const entry = { index: k, tool: op.tool };
+            if (op.as !== undefined) {
+                entry.as = op.as;
+                refs[op.as] = result.objID;
+            }
+            results.push({ ...entry, ...result });
+        } catch (e) {
+            throw new Error(
+                `batch op #${k} (${op.tool}) failed: ${e.message}; nothing applied`
+            );
+        }
+    });
+    // Success: replace contents of the caller's object in place.
+    for (const key of Object.keys(project)) delete project[key];
+    Object.assign(project, work);
+    return { applied: results.length, results, refs };
 }
 
 // ---- widget catalog (schema) ----------------------------------------------

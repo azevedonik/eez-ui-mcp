@@ -30,7 +30,7 @@ Studio and no custom build are required** — it works against a stock install.
 
 ## Quick start
 
-1. **Install the plugin** into EEZ Studio (any 0.28.x install):
+1. **Install the plugin** into EEZ Studio (any 0.28.x–0.29.x install):
    ```
    node extension/install.mjs        # then restart EEZ Studio
    ```
@@ -45,7 +45,7 @@ Studio and no custom build are required** — it works against a stock install.
 
 ## Requirements
 
-- **EEZ Studio 0.28.x** installed (the plugin runs inside it).
+- **EEZ Studio 0.28.x–0.29.x (tested on 0.29.0)** installed (the plugin runs inside it).
 - **Node 18+** to run the MCP server.
 
 No build of EEZ Studio is needed. Authoring tools work without the app too (they

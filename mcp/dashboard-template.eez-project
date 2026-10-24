@@ -52,7 +52,14 @@
   "actions": [],
   "userPages": [],
   "userWidgets": [],
-  "styles": [],
+  "styles": [
+    {
+      "objID": "8dff39ac-4a13-4d0a-b7ac-47edbc20df97",
+      "name": "default",
+      "conditionalStyles": [],
+      "childStyles": []
+    }
+  ],
   "lvglGroups": {
     "objID": "f2f79c21-8769-ed90-c624-7405d4136ec9",
     "groups": []
